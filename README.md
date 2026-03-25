@@ -1,1 +1,0 @@
-# practice-arcus-memcached
