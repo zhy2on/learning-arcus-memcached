@@ -283,3 +283,5 @@ RDBMS로 비유하면:
 - `default engine` → InnoDB (실제 저장 엔진, 메모리/인덱스/버퍼 관리)
 
 다만 InnoDB처럼 디스크 페이지를 다루는 게 아니라, RAM 안의 item/collection을 직접 관리한다.
+> [!NOTE]
+> 이는 default engine(default_engine.so) 기준이며, 엔터프라이즈용 엔진처럼 디스크 기반 스토리지를 다루는 구현체도 플러그인 형태로 교체해서 사용할 수 있다.
