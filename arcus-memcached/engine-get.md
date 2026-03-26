@@ -200,9 +200,201 @@ hash_item *item_get(const void *key, const uint32_t nkey)
 
 실제 구현은 `engines/default/items.c`에 있고, `item_release()`도 같은 `cache_lock` 아래에서 동작한다. 즉 조회 시 refcount를 올리고, 서버 레이어가 사용을 마친 뒤 다시 refcount를 내리는 생명주기 전체가 같은 락 규칙을 따른다.
 
+### GET에도 왜 락이 필요한가?
+
+겉으로 보면 `get`은 읽기라서 락이 없어도 될 것처럼 보이지만, Arcus의 `item_get()`은 단순 조회가 아니다. `do_item_get()` 안에서는:
+
+- 해시 테이블 탐색
+- 만료 item unlink
+- `refcount++`
+- 필요 시 LRU 위치 갱신
+
+까지 함께 일어난다.
+
+즉 `get`도 내부적으로는 **공유 자료구조를 수정하는 경로**이기 때문에 락이 필요하다.
+
+### 그럼 다른 요청은 다 못 읽나?
+
+정확히는 "다른 프로세스"보다 **같은 memcached 서버 안의 다른 worker thread**가 이 구간에 동시에 들어오지 못하게 막는 것이다.
+
+`cache_lock`은 `pthread_mutex_t`이므로:
+
+- 이 락을 잡은 thread 하나만 item/assoc/LRU 관련 공유 구조를 만질 수 있고
+- 다른 worker thread는 같은 락을 잡으려 할 때 잠시 대기한다
+
+즉 한 thread가 `item_get()` 안에서 `cache_lock`을 잡고 있으면, 다른 thread는 같은 엔진의 캐시 메타데이터를 동시에 읽고/수정하지 못한다.
+
+이렇게 하는 이유는 예를 들어:
+
+- 한 thread가 item을 조회하는 동안
+- 다른 thread가 같은 item을 unlink/free 하거나
+- LRU를 동시에 조작하는 race
+
+를 막기 위해서다.
+
+> [!NOTE]
+> 조회와 해제가 동시에 올 수는 있지만, 둘 다 같은 `cache_lock`을 잡고 들어오기 때문에 **누가 먼저 락을 잡았는지에 따라 순서가 직렬화**된다.
+>
+> - 내가 먼저 락을 잡으면: `assoc_find -> 유효성 검사 -> refcount++`까지 안전하게 끝낸 뒤 락을 푼다.
+> - 다른 thread가 먼저 락을 잡으면: 그쪽이 unlink/free 같은 상태 변경을 먼저 끝내고, 나는 나중에 들어와 이미 없어진 상태를 보게 된다.
+>
+> 즉 "조회 도중 해제"가 동시에 뒤섞이는 게 아니라, 같은 락 아래에서 한쪽이 먼저 상태를 확정하고 다른 쪽이 그 결과를 보게 되는 구조다.
+
+### item_get()은 실제로 무엇을 하나?
+
+`item_get()` 자체는 작업을 많이 하지 않고, **락을 잡고 `do_item_get()`을 호출하는 얇은 래퍼**에 가깝다.
+
+즉 역할을 한 줄로 요약하면:
+
+- `item_get()` = 락 경계
+- `do_item_get()` = 실제 GET 핵심 로직
+
 ---
 
-## assoc_find() — 해시 테이블 조회
+## do_item_get() — 실제 GET 핵심 로직
+
+```c
+hash_item *do_item_get(const char *key, const uint32_t nkey, bool do_update)
+{
+    hash_item *it = assoc_find(key, nkey, GEN_ITEM_KEY_HASH(key, nkey));
+    if (it) {
+        rel_time_t current_time = svcore->get_current_time();
+        if (do_item_isvalid(it, current_time)) {
+            ITEM_REFCOUNT_INCR(it);
+            DEBUG_REFCNT(it, '+');
+            if (do_update) {
+                do_item_update(it, false);
+            }
+        } else {
+            do_item_unlink(it, ITEM_UNLINK_INVALID);
+            it = NULL;
+        }
+    }
+    return it;
+}
+```
+
+이 함수가 실제로 GET의 핵심이다. 순서를 보면:
+
+1. `assoc_find()`로 key를 찾고
+2. 찾았으면 `do_item_isvalid()`로 TTL/flush/prefix 유효성을 검사하고
+3. 유효하면 `refcount++`
+4. 필요하면 `do_item_update()`로 LRU 갱신
+5. 유효하지 않으면 `do_item_unlink()` 후 `NULL`
+
+즉 `do_item_get()`은 단순 lookup 함수가 아니라:
+
+- 조회
+- 유효성 판정
+- 참조 보호
+- LRU 관리
+
+를 한 번에 묶어 둔 함수다.
+
+### do_item_get() 한 줄씩 읽기
+
+#### `hash_item *it = assoc_find(...)`
+
+가장 먼저 해시 테이블에서 key를 찾는다. 이 단계의 `assoc_find()`는 정말 lookup만 담당한다.
+
+- key가 있는지 찾기
+- 충돌 체인 따라가기
+
+만 할 뿐,
+
+- TTL 검사
+- `refcount++`
+- LRU 갱신
+
+은 하지 않는다.
+
+즉 이 줄의 의미는 "해시 구조 안에 이 key가 있나?"다.
+
+#### `if (it)`
+
+찾았을 때만 그다음 처리를 한다. 못 찾았으면 `NULL` 그대로 반환하고 끝난다.
+
+즉 `assoc_find()`가 실패한 경우는:
+
+- key가 원래 없거나
+- 이미 누가 삭제했거나
+- 이미 해시 테이블에서 unlink된 경우
+
+라고 보면 된다.
+
+#### `rel_time_t current_time = svcore->get_current_time()`
+
+현재 시간을 한 번 읽어 둔다. 이 값은 바로 뒤 두 판단에 공통으로 쓰인다.
+
+- `do_item_isvalid()`에서 TTL / flush / prefix validity 검사
+- `do_item_update()`에서 LRU 갱신 여부 판단
+
+즉 GET 한 번 안에서 같은 시점 기준으로 판정하려고 현재 시각을 먼저 구하는 것이다.
+
+#### `if (do_item_isvalid(it, current_time))`
+
+해시 테이블에서 찾았다고 바로 성공은 아니다. 지금도 유효한 item인지 다시 확인한다.
+
+여기서 보는 것은:
+
+- TTL 만료
+- `flush_all`로 무효화되었는지
+- prefix invalid인지
+
+다.
+
+즉 "해시 테이블에 아직 남아 있다"와 "이번 GET 시점에 유효하다"는 같은 뜻이 아니다.
+
+#### `ITEM_REFCOUNT_INCR(it)`
+
+유효하면 먼저 `refcount`를 올린다.
+
+이 순서가 중요한 이유는, 이제 이 item을 호출자 쪽으로 돌려줄 예정이므로 다른 thread가 중간에 free하지 못하게 먼저 pin 해야 하기 때문이다.
+
+즉 순서는:
+
+1. 찾았다
+2. 유효하다
+3. 이제 내가 쓸 것이니 `refcount++`
+
+로 읽으면 된다.
+
+#### `if (do_update) { do_item_update(it, false); }`
+
+그다음 필요하면 LRU를 갱신한다.
+
+`do_update`가 켜져 있으면:
+
+- 이번 read를 최근 접근으로 반영할지 판단하고
+- 너무 최근에 이미 갱신한 게 아니면 LRU 앞쪽으로 옮긴다
+
+즉 refcount로 "이 item은 내가 잡았다"를 먼저 확정한 뒤, eviction 정책을 위한 접근 흔적을 반영하는 흐름이다.
+
+#### `else { do_item_unlink(...); it = NULL; }`
+
+찾긴 찾았는데 유효하지 않으면, 그 자리에서 invalid item으로 처리한다.
+
+```c
+do_item_unlink(it, ITEM_UNLINK_INVALID);
+it = NULL;
+```
+
+왜 바로 unlink하냐면 Arcus가 lazy expiration 구조이기 때문이다. 별도 청소 스레드가 주기적으로 다 치우는 게 아니라, 누가 다시 건드렸을 때 "만료됐네" 하고 그 자리에서 정리한다.
+
+그리고 `it = NULL`로 바꾸는 이유는 호출자 입장에서는 최종적으로 miss처럼 보이게 하기 위해서다.
+
+즉:
+
+- 해시 테이블에는 남아 있었을 수 있지만
+- 이번 GET 기준으로는 miss
+
+가 된다.
+
+한 줄로 요약하면, `do_item_get()`은 "찾고 -> 유효성 검사하고 -> 유효하면 보호(refcount)하고 필요하면 LRU를 갱신하고 -> 무효하면 그 자리에서 unlink하는 함수"다.
+
+아래 섹션들은 이 `do_item_get()`의 각 단계를 주제별로 풀어 쓴 것이다.
+
+### 1. `assoc_find()` — 해시 테이블 조회
 
 [해시 조회 구조 다이어그램 보기](./engine-get-hash-lookup.md)
 
@@ -233,7 +425,7 @@ while (it) {
 
 ---
 
-## do_item_isvalid() — lazy expiration
+### 2. `do_item_isvalid()` — lazy expiration
 
 ```c
 if (it->exptime != 0 && it->exptime <= current_time) {
@@ -263,7 +455,7 @@ return true;
 
 ---
 
-## ITEM_REFCOUNT_INCR() — 참조 카운트
+### 3. `ITEM_REFCOUNT_INCR()` — 참조 카운트
 
 item을 반환하기 전에 `refcount`를 증가시킨다. 서버 레이어(`memcached.c`)가 item을 사용하는 동안 엔진이 해당 메모리를 해제하지 못하게 막는 장치다. 서버가 응답 전송을 마치면 `item_release()`를 호출해 `refcount`를 감소시키고, 0이 되면 그때 메모리를 해제할 수 있다.
 
@@ -277,7 +469,7 @@ item을 반환하기 전에 `refcount`를 증가시킨다. 서버 레이어(`mem
 > [!NOTE]
 > `get`에서 `refcount++`를 하는 이유는 "조회 성공" 자체를 기록하려는 게 아니라, **응답 전송이 끝날 때까지 item 메모리를 pin 하기 위해서**다. 서버는 item을 찾은 뒤 value를 바로 복사하지 않고, 그 item 메모리를 가리키는 채로 응답을 만든다. 이때 다른 경로에서 TTL 만료, delete, replace, eviction이 일어나도, 현재 요청이 쓰는 메모리는 `item_release()` 전까지 살아 있어야 한다.
 
-### refcount == 0은 언제 확인하나?
+#### refcount == 0은 언제 확인하나?
 
 `refcount`를 백그라운드에서 계속 감시하는 스레드가 있는 건 아니다. Arcus는 **상태 변화가 발생하는 함수 경계에서 즉석으로 검사**한다.
 
@@ -292,7 +484,7 @@ item을 반환하기 전에 `refcount`를 증가시킨다. 서버 레이어(`mem
 
 ---
 
-## TTL 경계에서 GET은 어떻게 동작하나?
+### 4. TTL 경계에서 GET은 어떻게 동작하나?
 
 기준은 `do_item_get()` 안의 `do_item_isvalid(it, current_time)` 검사 시점이다.
 
@@ -309,7 +501,7 @@ item을 반환하기 전에 `refcount`를 증가시킨다. 서버 레이어(`mem
 
 이라면 이 요청은 이미 item을 잡았기 때문에 값을 정상적으로 받는다. 반면 그 뒤에 새로 들어온 `get`은 expired로 보고 실패할 수 있다.
 
-### getattr는 왜 조금 다르게 느껴지나?
+#### getattr는 왜 조금 다르게 느껴지나?
 
 `item_getattr()`도 내부적으로는 `do_item_get(key, nkey, DO_UPDATE)`를 호출해서 똑같이 유효성 검사를 하고 `refcount++` 한다. 하지만 실제 구현은 락 안에서 attribute를 읽어 `attr_data`에 복사한 뒤 곧바로 `do_item_release(it)`를 호출한다.
 
@@ -322,7 +514,7 @@ item을 반환하기 전에 `refcount`를 증가시킨다. 서버 레이어(`mem
 
 ---
 
-## do_item_update() — LRU 갱신
+### 5. `do_item_update()` — LRU 갱신
 
 ```c
 } else if (it->time < (current_time - ITEM_UPDATE_INTERVAL)) {
@@ -339,6 +531,14 @@ item을 반환하기 전에 `refcount`를 증가시킨다. 서버 레이어(`mem
 실제 호출은 `do_item_get()` 안에서 `do_item_update(it, false)` 형태로 이루어진다. 여기서 `false`는 force update가 아니라는 뜻이고, 그래서 `ITEM_UPDATE_INTERVAL` 조건을 만족할 때만 LRU를 만진다.
 
 `item_unlink_q()`로 현재 위치에서 빼고, `it->time`을 현재 시각으로 갱신한 뒤 `item_link_q()`로 `heads[clsid]`에 다시 연결한다.
+
+> [!NOTE]
+> 여기서 목적과 최적화 조건을 분리해서 보는 게 중요하다.
+>
+> - **목적**: 최근에 다시 읽힌 item을 LRU head 쪽으로 옮겨서 eviction 후보에서 멀리 두는 것
+> - **60초 조건**: 그 LRU 재배치를 GET마다 매번 하면 비용이 크므로, 일정 시간(`ITEM_UPDATE_INTERVAL`)이 지난 경우에만 다시 수행하는 것
+>
+> 즉 "60초가 지나야 올린다" 자체가 목적은 아니다. 원래 목적은 최근 사용 item을 eviction 후보에서 멀리 두는 것이고, 60초 조건은 그 작업을 너무 자주 하지 않기 위한 최적화다.
 
 ---
 
