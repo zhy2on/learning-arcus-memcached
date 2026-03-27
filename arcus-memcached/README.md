@@ -9,4 +9,7 @@ Arcus memcached 동작 흐름을 학습하며 정리한 문서입니다.
 3. [Engine GET Hash Lookup](./engine-get-hash-lookup.md)
 4. [Engine Interface](./engine-interface.md)
 5. [Process SET](./process-set.md)
-6. [Process LOP INSERT](./process-lop-insert.md)
+6. [Engine SET](./engine-set.md)
+7. [Engine ALLOCATE](./engine-allocate.md)
+8. [Memory Model](./memory-model.md)
+9. [Process LOP INSERT](./process-lop-insert.md)

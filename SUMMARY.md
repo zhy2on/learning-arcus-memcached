@@ -7,4 +7,7 @@
 - [Engine GET Hash Lookup](./arcus-memcached/engine-get-hash-lookup.md)
 - [Engine Interface](./arcus-memcached/engine-interface.md)
 - [Process SET](./arcus-memcached/process-set.md)
+- [Engine SET](./arcus-memcached/engine-set.md)
+- [Engine ALLOCATE](./arcus-memcached/engine-allocate.md)
+- [Memory Model](./arcus-memcached/memory-model.md)
 - [Process LOP INSERT](./arcus-memcached/process-lop-insert.md)
