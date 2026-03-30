@@ -1,259 +1,185 @@
 # arcus-memcached 엔진 ALLOCATE 흐름
 
-```mermaid
-flowchart TD
-    A["mc_engine.v1->allocate()\n(memcached.c → default_engine.c)"] --> B
-
-    subgraph default_allocate["default_item_allocate()"]
-        B["item_kv_size() / slabs_clsid()"]
-        B --> C{"slab class 존재?"}
-        C -->|"no"| D["ENGINE_E2BIG"]
-        C -->|"yes"| E["item_alloc(key, nkey, flags, exptime, nbytes, cookie)"]
-    end
-
-    subgraph item_alloc_block["item_alloc() / do_item_alloc()"]
-        E --> F["LOCK_CACHE()"]
-        F --> G["do_item_alloc()"]
-        G --> H["do_item_mem_alloc(ntotal, id, cookie)"]
-        H --> I{"raw 메모리 확보 성공?"}
-        I -->|"no"| J["NULL → ENGINE_ENOMEM"]
-        I -->|"yes"| K["item 헤더 초기화\nrefcount=1\nLRU 미연결 상태"]
-    end
-
-    subgraph mem_policy["do_item_mem_alloc()"]
-        H --> M1["1. slabs_alloc() 바로 시도"]
-        M1 --> M2{"성공?"}
-        M2 -->|"yes"| K
-        M2 -->|"no"| M3["2. invalid/expired item reclaim 시도"]
-        M3 --> M4{"성공?"}
-        M4 -->|"yes"| K
-        M4 -->|"no"| M5["3. slabs_alloc() 재시도"]
-        M5 --> M6{"성공?"}
-        M6 -->|"yes"| K
-        M6 -->|"no"| M7["4. evict_to_free면 eviction 시도"]
-        M7 --> M8{"성공?"}
-        M8 -->|"yes"| K
-        M8 -->|"no"| M9["5. 비상 tail repair 시도"]
-        M9 --> M10{"성공?"}
-        M10 -->|"yes"| K
-        M10 -->|"no"| J
-    end
-```
-
----
-
-## 한 줄 요약
-
-`do_item_mem_alloc()`은 단순 `malloc` 함수가 아니라, **새 slab 할당 → invalid item 재활용 → eviction → 비상 repair**까지 포함한 default engine의 메모리 확보 정책 핵심 함수다.
-
-즉 `allocate()`는 단순히 "빈 메모리 있으면 하나 준다"가 아니라, 메모리 압박 상황에서 **어떤 공간을 다시 쓸지**까지 판단하는 경로다.
-
-슬랩 메모리, LRU, small LRU 같은 배경 개념은 별도 문서인 [메모리 모델](./memory-model.md)에서 따로 정리했다.
-
----
-
 ## 전체 호출 흐름
-
-`set`의 1단계에서 `memcached.c`는:
-
-```c
-mc_engine.v1->allocate(mc_engine.v0, c, &it, key, nkey, vlen,
-                       htonl(flags), realtime(exptime), req_cas_id);
-```
-
-를 호출한다.
-
-default engine 기준으로 이 호출은 다음 경로를 탄다.
 
 ```c
 mc_engine.v1->allocate(...)
-  -> default_item_allocate(...)
-     -> item_alloc(...)
-        -> do_item_alloc(...)
-           -> do_item_mem_alloc(...)
-              -> slabs_alloc() / reclaim / evict / repair
+  -> default_item_allocate()   // 엔진 인터페이스 진입, 크기 검증
+     -> item_alloc()           // cache_lock 획득
+        -> do_item_alloc()     // hash_item 헤더 초기화
+           -> do_item_mem_alloc()  // 실제 메모리 확보 정책
+              -> slabs_alloc() / reclaim / regain / evict / repair
 ```
 
-즉 읽는 순서는:
+```mermaid
+flowchart TD
+    A["mc_engine.v1->allocate()"] --> B
 
-1. `default_item_allocate()`에서 엔진 인터페이스 진입
-2. `item_alloc()`에서 락 경계 진입
-3. `do_item_alloc()`에서 item 헤더 초기화
-4. `do_item_mem_alloc()`에서 실제 raw 메모리 확보 정책 수행
+    subgraph default_allocate["default_item_allocate()"]
+        B["ntotal = item_kv_size()\nid = slabs_clsid(ntotal)"]
+        B --> C{"id == 0?"}
+        C -->|"yes"| D["ENGINE_E2BIG"]
+        C -->|"no"| E["item_alloc()"]
+    end
 
-이다.
+    subgraph item_alloc_block["item_alloc() → do_item_alloc()"]
+        E --> F["LOCK_CACHE()"]
+        F --> G["do_item_mem_alloc(ntotal, id, cookie)"]
+        G --> H{"메모리 확보 성공?"}
+        H -->|"no"| I["NULL → ENGINE_ENOMEM"]
+        H -->|"yes"| J["hash_item 헤더 초기화\nrefcount=1, LRU 미연결"]
+    end
+
+    subgraph mem_policy["do_item_mem_alloc() 내부 순서"]
+        G --> P1["0. clsid/lruid 결정"]
+        P1 --> P2["1. slabs_alloc() 바로 시도"]
+        P2 -->|"실패"| P3["2. small이면 regain 먼저"]
+        P3 --> P4["3. invalid item reclaim 시도"]
+        P4 -->|"실패"| P5["4. slabs_alloc() 재시도"]
+        P5 -->|"실패"| P6["5. eviction 시도"]
+        P6 -->|"실패"| P7["6. tail repair (비상)"]
+        P7 -->|"실패"| I
+    end
+```
 
 ---
 
-## default_item_allocate()
+## 메모리 구조: SM allocator vs Slab allocator
 
-`default_engine.c`의 `default_item_allocate()`는 엔진 인터페이스 레벨의 allocate 구현체다.
+### 왜 두 allocator가 있나
 
-핵심 코드는:
+Slab allocator는 **고정 크기 chunk** 방식이다. 크기별로 class가 나뉘고, 각 class의 chunk 크기에 맞게 메모리를 준다.
 
-```c
-uint32_t ntotal = item_kv_size(nkey, nbytes);
-unsigned int id = slabs_clsid(ntotal);
-if (id == 0) {
-    return ENGINE_E2BIG;
-}
-
-it = item_alloc(key, nkey, flags, exptime, nbytes, cookie);
-if (it != NULL) {
-    item_set_cas(it, cas);
-    *item = it;
-    ret = ENGINE_SUCCESS;
-} else {
-    ret = ENGINE_ENOMEM;
-}
 ```
-
-여기서 하는 일은 단순하다.
-
-1. key/value 전체 크기 `ntotal` 계산
-2. 이 크기를 담을 수 있는 slab class 찾기
-3. class가 없으면 너무 큰 item이므로 `ENGINE_E2BIG`
-4. `item_alloc()` 호출
-5. 성공하면 CAS를 세팅하고 반환
-
-중요한 점은 이 함수가 **실제 캐시 등록을 하지 않는다는 것**이다.
-
-이 단계에서 만들어진 item은:
-
-- 메모리만 확보된 상태
-- 아직 해시 테이블에 없음
-- 아직 LRU에도 없음
-- 아직 key lookup으로 보이지 않음
-
-즉 "캐시에 들어간 item"이 아니라, **나중에 store에 넘길 준비가 된 미완성 item**이다.
-
----
-
-## item_alloc()
-
-`items.c`의 `item_alloc()`은 매우 얇은 래퍼다.
-
-```c
-LOCK_CACHE();
-it = do_item_alloc(key, nkey, flags, exptime, nbytes, cookie);
-UNLOCK_CACHE();
-```
-
-여기서 중요한 것은 **할당도 cache_lock 아래에서 이뤄진다**는 점이다.
-
-이유는 뒤쪽에서 `do_item_mem_alloc()`이:
-
-- LRU를 훑고
-- reclaim / eviction / invalidate를 하고
-- tail item을 건드릴 수도 있기 때문
-
-이다.
-
-즉 이 경로는 단순 allocator 호출이 아니라, 캐시 공유 구조를 건드릴 수 있는 경로다.
-
----
-
-## do_item_alloc()
-
-`do_item_alloc()`은 두 역할을 맡는다.
-
-1. `do_item_mem_alloc()`로 raw 메모리 블록 확보
-2. 그 블록을 실제 `hash_item` 형태로 초기화
-
-핵심 코드는:
-
-```c
-size_t ntotal = item_kv_size(nkey, nbytes);
-unsigned int id = slabs_clsid(ntotal);
+slab class 1: 96바이트 chunk
+slab class 2: 120바이트 chunk
+slab class 3: 152바이트 chunk
 ...
-it = do_item_mem_alloc(ntotal, id, cookie);
-if (it == NULL)  {
-    return NULL;
-}
-it->slabs_clsid = id;
-
-it->next = it->prev = it; /* unlinked from LRU */
-it->h_next = 0;
-it->refcount = 1;         /* caller owns one reference */
-it->iflag = config->use_cas ? ITEM_WITH_CAS : 0;
-it->nkey = nkey;
-it->nbytes = nbytes;
-it->flags = flags;
-memcpy((void*)item_get_key(it), key, nkey);
-it->exptime = exptime;
-it->pfxptr = NULL;
 ```
 
-이 함수의 포인트는:
+50바이트 아이템이 slab class 1에 들어가면 96바이트 chunk를 통째로 쓴다. **46바이트 낭비(48%)**. small item일수록 낭비 비율이 커진다. collection 내부 노드들은 크기가 제각각이라 더 심하다.
 
-- `do_item_mem_alloc()`은 아직 "그냥 메모리 블록"을 가져오는 단계
-- `do_item_alloc()`이 그 블록을 실제 item으로 완성하는 단계
+SM(Small Memory) allocator는 **가변 크기 slot** 방식으로 이 문제를 해결한다. 50바이트 아이템이 56바이트 slot만 쓴다.
 
-라는 것이다.
+### 왜 SM으로 통일하지 않나: 내부 단편화 vs 외부 단편화
 
-특히 여기서:
+- **내부 단편화**: 할당받은 공간 안에서 실제 데이터보다 큰 공간이 낭비. 고정 크기(slab)의 문제.
+- **외부 단편화**: 전체 여유 공간은 충분하지만 연속된 큰 공간이 없어서 할당 실패. 가변 크기(SM)의 문제.
 
-- `next = prev = it`
-  아직 LRU에 연결되지 않았음을 뜻하는 특수 상태
-- `h_next = 0`
-  아직 해시 체인에도 연결되지 않았음
-- `refcount = 1`
-  호출자가 이 새 item을 하나 들고 시작함
+**Large item (예: 상품 상세 페이지 80KB)**
 
-이라는 점이 중요하다.
+Slab: 같은 종류끼리 크기가 비슷해 하나의 class가 커버한다. 해제된 chunk는 즉시 동일 크기 요청에 재사용. 외부 단편화 없음.
 
-즉 새 item은 만들어지는 순간부터 "호출자가 소유한 unlinked 객체"다.
+SM으로 관리하면:
+```
+[80KB used | 75KB free | 82KB used | ...]
+```
+76KB 요청이 75KB 공간에 못 들어간다. large item은 크기가 크기 때문에 자투리 공간이 재활용되기 어렵다.
 
----
+**Small item (예: btree element)**
 
-## do_item_mem_alloc()
+```
+btree_elem (value 10B)  → ntotal 약 40B
+btree_elem (value 200B) → ntotal 약 230B
+btree_elem (value 2KB)  → ntotal 약 2KB
+```
 
-이 함수가 실제 메모리 확보 정책의 중심이다.
+Slab으로 관리하면 크기가 다양하니 class가 수십 개 필요하고, 40B element가 96B chunk를 쓴다. SM으로 관리하면:
+```
+[40B free | 232B used | 40B free | 2048B used | 40B free | ...]
+```
+40B 자투리에 다음 40B element가 들어간다. small item은 작아서 조각난 공간도 재활용될 확률이 높다.
 
-핵심만 먼저 말하면 순서는 이렇다.
+**결론: 자투리 공간이 재활용될 확률이 기준이다.**
 
-1. 새 slab 메모리를 바로 할당 시도
-2. invalid/expired/flushed item 재활용 시도
-3. 정리 후 다시 slab 할당 시도
-4. 그래도 안 되면 eviction 시도
-5. 아주 예외적인 경우 tail repair 시도
-6. 끝까지 실패하면 `NULL`
+| | Small item | Large item |
+|---|---|---|
+| 내부 단편화 (slab 낭비) | 크다 → 문제 | 상대적으로 작다 → 감수 가능 |
+| 외부 단편화 위험 (SM 약점) | 낮다 (작은 공간도 재활용 쉬움) | 높다 (큰 연속 공간 필요) |
+| 결론 | SM 유리 | Slab 유리 |
 
-즉 이 함수는 단순 allocator가 아니라 **"어떻게든 item 하나가 들어갈 자리를 만드는 정책 함수"**다.
+### SM allocator 구조
 
-### 기본 변수
+256KB 블록(`SM_BLOCK_SIZE`)을 slab class 0에서 받아 그 안을 가변 크기 slot으로 쪼개 쓴다.
+
+```
+[sm_blck_t header(32B) | slot A | slot B | slot C | free slot ... ]
+```
 
 ```c
-hash_item *it = NULL;
-int tries;
-hash_item *search;
-hash_item *previt = NULL;
-rel_time_t current_time = svcore->get_current_time();
+#define SM_MIN_SLOT_SIZE 32      // 최소 slot 크기
+#define SM_MAX_SLOT_SIZE 49152   // 최대 slot 크기 (48K)
+#define SM_SLOT_UNIT_LEN 8       // 모든 크기는 8바이트 배수
+
+// MAX_SM_VALUE_LEN = SM_MAX_SLOT_SIZE - sizeof(sm_tail_t)
+// 이 값 이하인 아이템은 SM allocator에서 할당
 ```
 
-의미는 이렇다.
+각 slot은 head(`sm_slot_t`)와 tail(`sm_tail_t`)을 가진다. tail이 slot 끝에 있는 이유는 해제 시 앞쪽 인접 slot이 free인지 역방향으로 확인하기 위해서다.
 
-- `it`
-  최종적으로 확보한 메모리 블록
-- `tries`
-  스캔/회수 루프의 탐색 횟수 제한
-- `search`
-  LRU를 따라 탐색 중인 현재 item
-- `previt`
-  LRU를 뒤로 거슬러 올라가기 위한 이전 item
-- `current_time`
-  expiration / flush / validity 판단용 현재 시각
+**할당**: 요청 크기를 8바이트 단위로 올리고 → 맞는 free slot 찾기 → slot이 요청보다 크면 나머지를 잘라 free list에 돌려보냄 → 없으면 새 256KB 블록 할당.
+
+**해제**: 인접 free slot과 합치기(coalescing). 블록 전체가 비면 slab으로 반환. Slab은 freelist에 추가만 하지만 SM은 단편화를 줄이기 위해 합친다.
+
+### SM과 slab 간 fallback은 없다
+
+할당 경로는 오직 `ntotal` 크기로 결정된다.
+
+```c
+// do_slabs_alloc 내부
+if (size <= MAX_SM_VALUE_LEN) {
+    return do_smmgr_alloc(size);  // SM, id 무시. NULL이면 그냥 NULL
+}
+p = &slabsp->slabclass[id];  // ntotal이 클 때만
+```
+
+- `ntotal <= MAX_SM_VALUE_LEN` → 무조건 SM
+- `ntotal > MAX_SM_VALUE_LEN` → 무조건 slab
+
+SM이 꽉 차서 NULL이 반환되면 slab으로 가는 게 아니라, reclaim/eviction 루프가 small LRU에서 아이템을 해제해 SM 공간을 확보한 뒤 다시 SM에서 시도한다.
 
 ---
 
-## `clsid_based_on_ntotal`과 `lruid`
+## LRU 구조
 
-함수 초반에는 `clsid_based_on_ntotal`과 `lruid`를 정한다.
+### LRU 큐 종류
+
+- **LRU_CLSID_FOR_SMALL (= 0)**: small item 전용. SM allocator에서 할당된 아이템을 크기 구분 없이 하나의 큐로 통합 관리.
+- **slab class별 LRU (1, 2, 3...)**: large item 전용. 각 slab class마다 별도 큐.
+
+### LRU에 들어가는 것 vs 안 들어가는 것
+
+LRU에는 **hash_item** 단위만 들어간다.
+
+```
+LRU_CLSID_FOR_SMALL 큐
+  ├─ 작은 KV hash_item (ntotal <= MAX_SM_VALUE_LEN)
+  └─ collection hash_item (IS_COLL_ITEM, list/btree/set/map 전체 대표)
+
+slab class N 큐
+  └─ 큰 KV hash_item (ntotal > MAX_SM_VALUE_LEN)
+```
+
+collection 내부 노드(`list_elem_item`, `btree_elem_item` 등)는 **어떤 LRU에도 없다**. `do_item_link`가 호출되지 않는다. eviction 단위가 collection 전체(hash_item)이기 때문이다. collection이 evict되면 내부 노드도 같이 해제된다.
+
+```
+LRU_CLSID_FOR_SMALL 큐
+  └─ hash_item (list 전체 대표) ← LRU에 있음
+        └─ list_elem_item [0]
+        └─ list_elem_item [1]  ← LRU에 없음
+        └─ list_elem_item [2]
+```
+
+---
+
+## do_item_mem_alloc() 상세
+
+### 0단계: clsid, lruid 결정
 
 ```c
 if (clsid == LRU_CLSID_FOR_SMALL) {
     clsid_based_on_ntotal = slabs_clsid(ntotal);
-    lruid                 = clsid;
+    lruid                 = LRU_CLSID_FOR_SMALL;
 } else {
     clsid_based_on_ntotal = clsid;
     if (ntotal <= MAX_SM_VALUE_LEN) {
@@ -264,18 +190,32 @@ if (clsid == LRU_CLSID_FOR_SMALL) {
 }
 ```
 
-여기서:
+`clsid`(caller 입력)로부터 두 값이 파생된다:
 
-- `clsid_based_on_ntotal`
-  실제 메모리를 어느 slab class에서 할당할지를 뜻하는 변수
-- `lruid`
-  reclaim / eviction 대상을 어느 LRU 그룹에서 찾을지를 뜻하는 변수
+- **`lruid`**: 공간 확보 시 어느 LRU에서 희생양을 찾을지
+- **`clsid_based_on_ntotal`**: 실제 slab 할당에 쓸 class 번호 (SM 할당에서는 무시됨)
 
----
+**caller 유형별 동작:**
 
-## 1. slabs_alloc() 바로 시도
+| caller | clsid 값 | 분기 |
+|---|---|---|
+| collection 노드 (`coll_list.c` 등) | `LRU_CLSID_FOR_SMALL` (= 0, 플래그) | 첫 번째 분기 |
+| 일반 KV 아이템 (`do_item_alloc`) | `slabs_clsid(ntotal)` (1, 2...) | else 분기 |
 
-가장 먼저 하는 일은 가능하면 새 slab 블록을 바로 받는 것이다.
+collection 노드 allocator는 `LRU_CLSID_FOR_SMALL`을 플래그로 명시적으로 넘긴다. 이 플래그의 의미: "공간 확보 시 small LRU에서 희생양을 찾아라." `do_item_alloc`은 이 개념을 모르고 slab class만 계산해서 넘긴다. 그래서 else 분기에서 `ntotal` 크기로 `lruid`를 판단한다.
+
+`LRU_CLSID_FOR_SMALL`을 0으로 그대로 `clsid_based_on_ntotal`에 쓰면 `slabclass[0]`(SM 블록 256KB 단위용)을 쓰게 되어 잘못된다. 그래서 `slabs_clsid(ntotal)`로 올바른 slab class를 내부에서 계산한다.
+
+**실제 할당 경로 정리:**
+
+| 케이스 | 실제 할당 | lruid | clsid_based_on_ntotal |
+|---|---|---|---|
+| small KV 아이템 | SM | LRU_CLSID_FOR_SMALL | slab class (무시됨) |
+| large KV 아이템 | slab class N | slab class N | slab class N |
+| collection 노드 (ntotal 작음) | SM | LRU_CLSID_FOR_SMALL | slabs_clsid(ntotal) (무시됨) |
+| collection 노드 (ntotal 큼) | slab | LRU_CLSID_FOR_SMALL | slabs_clsid(ntotal) (사용됨) |
+
+### 1단계: slabs_alloc() 바로 시도
 
 ```c
 it = slabs_alloc(ntotal, clsid_based_on_ntotal);
@@ -285,19 +225,9 @@ if (it != NULL) {
 }
 ```
 
-이게 가장 이상적인 경우다.
+빈 자리가 있으면 reclaim/eviction 없이 바로 반환. 가장 이상적인 경로.
 
-- free slab 공간이 있으면
-- reclaim도 eviction도 없이
-- 그냥 새 블록을 하나 받아서 반환
-
-즉 "빈 자리가 있으면 제일 먼저 그걸 쓴다"는 정책이다.
-
----
-
-## 2. small memory shortage면 regain 먼저
-
-small LRU에서는 공간 부족이 심할 때 `do_item_regain()`을 먼저 실행한다.
+### 2단계: small이면 regain 먼저
 
 ```c
 if (config->evict_to_free && lruid == LRU_CLSID_FOR_SMALL) {
@@ -308,63 +238,29 @@ if (config->evict_to_free && lruid == LRU_CLSID_FOR_SMALL) {
 }
 ```
 
-이건 본격적인 할당 실패나 eviction 루프에 들어가기 전에, small memory 압박을 완화하려는 선제 정리 단계다.
+SM allocator는 공간 부족 수준을 0~100(`space_shortage_level`)으로 추적한다. 0이면 여유롭고 100이면 거의 꽉 찬 상태. small item이고 압박이 있으면 본격적인 할당 시도 전에 small LRU tail을 미리 정리한다.
 
-`do_item_regain()` 자체를 보면 small LRU tail에서 시작해 최대 `count`개 정도를 뒤에서부터 훑는다.
+**reclaim vs regain vs eviction:**
 
-```c
-search = itemsp->tails[clsid];
-while (search != NULL) {
-    previt = search->prev;
-    if (search->refcount == 0) {
-        if (do_item_isvalid(search, current_time)) {
-            do_item_evict(search, clsid, current_time, cookie);
-        } else {
-            do_item_invalidate(search, clsid, true);
-        }
-        nregains += 1;
-    } else {
-        item_unlink_q(search);
-    }
-    search = previt;
-    if ((--tries) == 0) break;
-}
+셋 다 메모리를 확보하는 수단이지만 목적, 대상, 타이밍이 다르다.
+
+- **reclaim** (`do_item_reclaim`): 특정 죽은 아이템 하나를 골라 **지금 할당하려는 아이템에 직접 재사용**. large/small 둘 다 발생하지만 동작이 다르다.
+  - large item: 같은 slab class라 chunk 크기가 같으니 그 메모리 블록을 그대로 씀 (해제 없음)
+  - small item: SM slot을 해제하고 새 slot을 다시 받음 (해제 후 재할당)
+- **regain** (`do_item_regain`): **small item에서만** 발생. small LRU tail을 쭉 스캔해서 아이템들을 한꺼번에 정리해 SM pool에 공간을 확보. 정리된 공간이 현재 할당에 직접 쓰이는 게 아니라 이후 `slabs_alloc()` 호출이 성공할 확률을 높임. lazy expiration 잔재 청소가 주목적이며, `space_shortage_level`이 높으면 살아있는 아이템도 축출.
+- **eviction**: 할당이 끝까지 실패했을 때 마지막 수단으로 살아있는 아이템을 강제 축출.
+
+타이밍도 다르다:
+
+```
+1. slabs_alloc() 바로 시도
+2. regain  ← 할당 실패 전 선제 정리 (small item + 압박 있을 때만)
+3. reclaim ← 실패 후 죽은 아이템 하나씩 직접 재활용 (large/small 둘 다)
+4. slabs_alloc() 재시도
+5. eviction ← 마지막 수단, 살아있는 아이템도 희생
 ```
 
-읽는 포인트는 이렇다.
-
-1. 대상은 small LRU tail 쪽이다  
-   `clsid = LRU_CLSID_FOR_SMALL` 기준으로 tail부터 본다. 즉 오래된 small item들부터 정리 대상으로 삼는다.
-
-2. `refcount == 0`인 item만 실제로 회수한다  
-   누군가 쓰고 있는 item은 바로 없앨 수 없기 때문이다.
-
-3. 유효한 item이면 `do_item_evict()`  
-   아직 살아 있는 item이지만 공간 부족 완화를 위해 희생시킨다.
-
-4. 이미 무효한 item이면 `do_item_invalidate()`  
-   expired / flushed / invalid prefix 상태라면 그냥 unlink해서 정리한다.
-
-5. `refcount > 0`이면 LRU에서만 잠시 분리한다  
-   바로 free할 수는 없지만, tail 쪽에 붙어 있으면 계속 reclaim/evict 후보 탐색을 방해할 수 있으므로 일단 `item_unlink_q(search)`로 LRU에서만 빼둔다. 이 item은 나중에 refcount가 0이 되면 `do_item_release()` 경로에서 다시 적절히 처리된다.
-
-즉 `do_item_regain()`은:
-
-- 새 메모리 블록을 직접 만들어내는 함수라기보다
-- small LRU tail을 짧게 정리해서
-- 이후 `slabs_alloc()`이나 reclaim/eviction이 더 잘 되게 만드는
-
-**사전 정리 함수**에 가깝다.
-
-왜 small memory에서만 먼저 이걸 하냐고 보면, small item은 수가 많고 tail 쪽에 오래된 객체가 많이 쌓일 가능성이 높아서 메모리 부족 시 이런 선제 정리의 효과가 크기 때문이다.
-
----
-
-## 3. invalid item reclaim 시도
-
-그 다음은 sticky LRU와 일반 LRU에서 invalid item을 찾아 재활용한다.
-
-공통 조건은 이렇다.
+### 3단계: invalid item reclaim
 
 ```c
 if (search->refcount == 0 && !do_item_isvalid(search, current_time)) {
@@ -372,191 +268,86 @@ if (search->refcount == 0 && !do_item_isvalid(search, current_time)) {
 }
 ```
 
-즉 reclaim 대상은:
+`lowMK`~`curMK` 구간을 스캔해 invalid item을 재활용한다. LRU 전체를 매번 훑지 않기 위한 구조.
 
-- `refcount == 0`
-  아무도 사용 중이 아니고
-- `!do_item_isvalid(...)`
-  expired / flushed / invalid prefix 등으로 더 이상 유효하지 않은 item
+**do_item_reclaim() 내부 동작:**
 
-이다.
-
-여기서 `do_item_reclaim()`은 쉽게 말하면:
-
-- invalid item을 제거하고
-- 그 공간을 다시 사용 가능한 블록으로 돌리는 것
-
-이다.
-
-### lowMK -> curMK 스캔
-
-일반 LRU에서는 `lowMK`부터 `curMK`까지 두 단계로 나눠 invalid item을 찾는다.
-
-이 구조의 목적은 LRU 전체를 매번 처음부터 끝까지 훑지 않기 위해서다.
-
-- `lowMK`
-  재활용 후보 스캔의 낮은 경계
-- `curMK`
-  현재까지 진행한 스캔 위치
-
-즉 Arcus는 LRU를 조금씩 나눠 훑으며 reclaim 대상을 찾는다.
-
-특히 `exptime == 0`인 영구 item은 invalid가 되지 않으므로, `lowMK`를 위로 밀어올려 다음부터 덜 보게 한다.
-
----
-
-## 4. 정리 후 slabs_alloc() 재시도
-
-invalid item reclaim이나 invalidate가 일어났을 수 있으므로, 그 다음엔 다시 한 번 `slabs_alloc()`를 시도한다.
+코드 상 핵심 차이는 반환하는 포인터가 같냐 다르냐다:
 
 ```c
-it = slabs_alloc(ntotal, clsid_based_on_ntotal);
-```
-
-즉 reclaim 경로는 결국 "정리하고 나서 새 블록을 다시 받을 수 있나?"를 확인하는 준비 작업이다.
-
----
-
-## 5. 그래도 안 되면 eviction
-
-여전히 `it == NULL`이면 eviction 단계로 들어간다.
-
-```c
-if (!config->evict_to_free) {
-    do_item_stat_outofmemory(lruid);
-    return NULL;
-}
-```
-
-먼저 `evict_to_free`가 꺼져 있으면 여기서 바로 포기한다.  
-즉 메모리가 부족해도 기존 item을 쫓아내지 않는 정책이라면 그냥 OOM이다.
-
-켜져 있으면 tail 쪽에서 희생양을 찾는다.
-
-```c
-search = itemsp->tails[lruid];
-while (search != NULL) {
-    if (search->refcount == 0) {
-        if (do_item_isvalid(search, current_time)) {
-            do_item_evict(search, lruid, current_time, cookie);
-            it = slabs_alloc(ntotal, clsid_based_on_ntotal);
-        } else {
-            it = do_item_reclaim(search, ntotal, clsid_based_on_ntotal, lruid);
-        }
-        if (it != NULL) break;
-    } else {
-        item_unlink_q(search);
-    }
-    search = previt;
-}
-```
-
-경우를 나누면:
-
-- 유효한 item이면 `do_item_evict()`
-  정상 item을 희생시켜 공간 확보
-- 이미 invalid한 item이면 `do_item_reclaim()`
-  그냥 재활용
-- `refcount > 0`이면
-  지금 누군가 사용 중이므로 free할 수 없고, LRU에서만 잠시 분리
-
-즉 eviction 단계는:
-
-- tail부터 오래된 item을 보면서
-- 쫓아낼 수 있는 것은 evict하고
-- 이미 죽은 item은 reclaim하고
-- 잠긴 item은 건너뛰는
-
-과정이다.
-
----
-
-## 6. 마지막 비상 수단: tail repair
-
-그래도 실패하고 small LRU도 아니면, 마지막으로 tail repair를 시도한다.
-
-```c
-if (search->refcount != 0 &&
-    search->time + TAIL_REPAIR_TIME < current_time) {
-    do_item_repair(search, lruid);
-    it = slabs_alloc(ntotal, clsid_based_on_ntotal);
-}
-```
-
-이건 정상 경로가 아니라, 주석 그대로 아주 드문 refcount leak 대응용 안전장치다.
-
-의미는:
-
-- refcount가 0이 아닌데
-- tail에 너무 오래 남아 있는 item이 있으면
-- 비정상적으로 잠긴 것으로 보고 강제로 repair
-
-하는 것이다.
-
-즉 시스템이 영원히 메모리 부족에 빠지는 것을 막기 위한 최후 수단이다.
-
----
-
-## 성공 시 마무리
-
-성공하면 반환 직전에:
-
-```c
+// large item (lruid != LRU_CLSID_FOR_SMALL)
+slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
+do_item_unlink(it, ITEM_UNLINK_INVALID);
 it->slabs_clsid = 0;
-return (void *)it;
+return it;           // ← 같은 포인터 반환. chunk를 그대로 새 아이템으로 씀
+
+// small item (lruid == LRU_CLSID_FOR_SMALL)
+do_item_unlink(it, ITEM_UNLINK_INVALID);
+it = slabs_alloc(ntotal, clsid);   // ← SM pool에서 새 슬롯 할당
+return it;           // ← 다른 포인터 반환
 ```
 
-를 수행한다.
+- large: slab은 같은 class 안에서 모든 chunk가 고정 크기 → 죽은 아이템의 chunk를 그대로 새 아이템에 덮어쓸 수 있다. 별도 해제/할당 없음.
+- small: SM은 가변 크기 슬롯 → 죽은 아이템 슬롯이 100바이트, 새 아이템이 200바이트면 맞지 않는다. 따라서 반드시 죽은 슬롯을 pool에 돌려보내고(`do_item_unlink` → SM free), 새 크기에 맞는 슬롯을 pool에서 받아야(`slabs_alloc`) 한다.
 
-이건 아직 item 초기화가 끝난 상태가 아니라는 뜻이다.
+"reclaim"이라는 이름은 특정 죽은 아이템을 **골라서 치우는 행위** 전체를 가리킨다. large는 그 자리를 직접 받고, small은 pool을 통해 간접적으로 받는다. 둘 다 "죽은 아이템을 표적으로 삼아 공간을 확보한다"는 점에서 같은 이름을 쓴다.
 
-실제로 바로 뒤 `do_item_alloc()`가:
+### 4단계: slabs_alloc() 재시도
+
+reclaim/invalidate로 공간이 생겼을 수 있으니 다시 시도한다.
+
+### 5단계: eviction
+
+```c
+if (!config->evict_to_free) { return NULL; }  // eviction 비활성화면 OOM
+
+search = itemsp->tails[lruid];
+// tail(오래된 것)부터 탐색
+// 유효한 item → do_item_evict() → slabs_alloc() 재시도
+// invalid item → do_item_reclaim()
+// refcount > 0 → LRU에서만 잠시 분리
+```
+
+### 6단계: tail repair (비상)
+
+refcount leak으로 인해 오래된 item이 tail에 계속 남아있는 비정상 상황 대응. 정상 경로가 아닌 안전장치.
+
+### 성공 시 마무리
+
+`do_item_mem_alloc()`은 raw 메모리 블록만 반환한다(`slabs_clsid = 0`). `do_item_alloc()`이 이 블록을 실제 hash_item으로 완성한다:
 
 ```c
 it->slabs_clsid = id;
-it->next = it->prev = it;
-it->h_next = 0;
-it->refcount = 1;
-...
+it->next = it->prev = it;  // LRU 미연결 상태
+it->h_next = 0;            // 해시 테이블 미연결 상태
+it->refcount = 1;          // caller가 소유
 ```
 
-로 이 raw 블록을 실제 item 객체로 완성한다.
-
-즉:
-
-- `do_item_mem_alloc()`
-  raw 메모리 블록 확보
-- `do_item_alloc()`
-  그 블록을 진짜 item으로 초기화
-
-라고 역할을 나눠 보면 된다.
+이 시점의 item은 메모리만 확보된 상태로, 해시 테이블에도 LRU에도 없다. 이후 `store` 단계에서 `do_item_link()`가 호출되어 비로소 캐시에 등록된다.
 
 ---
 
-## 보조 함수 감각 정리
+## sticky item도 reclaim될 수 있는 이유
 
-- `slabs_alloc(...)`
-  slab allocator에서 새 블록 확보
-- `do_item_reclaim(...)`
-  invalid item을 제거하고 그 공간을 재활용
-- `do_item_invalidate(...)`
-  invalid item을 unlink해서 정리
-- `do_item_evict(...)`
-  유효한 item을 강제로 축출
-- `do_item_repair(...)`
-  비정상적으로 오래 잠긴 tail item을 복구성 제거
+sticky item은 "영원히 불멸"이 아니다. 유효한 동안 eviction으로부터 강하게 보호되지만, 이미 invalid 상태가 되면 reclaim 대상이 된다.
+
+```c
+if (search->refcount == 0 && !do_item_isvalid(search, current_time)) {
+    it = do_item_reclaim(search, ntotal, clsid_based_on_ntotal, lruid);
+}
+```
+
+즉 sticky item이라도 refcount==0이고 expired/flushed/prefix invalid이면 reclaim된다.
 
 ---
 
-## 마지막 정리
+## 보조 함수 정리
 
-`do_item_mem_alloc()`은 단순 `malloc` 함수가 아니다.
-
-- 새 공간이 있으면 바로 쓰고
-- 없으면 expired/flushed item을 재활용하고
-- 그래도 없으면 eviction하고
-- 마지막에는 비정상 tail까지 repair하는
-
-**메모리 확보 정책의 핵심 함수**다.
-
-그래서 `set`의 `allocate()` 경로를 이해하려면 `default_item_allocate()`보다 한 단계 더 내려가서, 결국 `do_item_mem_alloc()`이 어떤 우선순위로 공간을 확보하는지를 보는 것이 중요하다.
+| 함수 | 역할 |
+|---|---|
+| `slabs_alloc()` | SM 또는 slab에서 새 메모리 블록 확보 |
+| `do_item_reclaim()` | invalid item 제거 후 공간 재활용 |
+| `do_item_invalidate()` | invalid item unlink (공간 즉시 재활용 없이 정리만) |
+| `do_item_evict()` | 유효한 item 강제 축출 |
+| `do_item_regain()` | small LRU tail 선제 정리 (lazy expiration 잔재 청소) |
+| `do_item_repair()` | 비정상적으로 오래 잠긴 tail item 강제 복구 |
