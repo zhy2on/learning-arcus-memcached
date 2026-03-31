@@ -321,18 +321,28 @@ small item에는 적용하지 않는다.
 
 ---
 
-## sticky item도 reclaim될 수 있는 이유
+## sticky item reclaim 조건
 
-sticky item은 "영원히 불멸"이 아니다.
-유효한 동안 eviction으로부터 강하게 보호되지만, 이미 invalid 상태가 되면 reclaim 대상이 된다.
+sticky item은 `exptime = (rel_time_t)(-1)` = 0xFFFFFFFF로 저장된다. `do_item_isvalid()`의 TTL 검사:
 
 ```c
-if (search->refcount == 0 && !do_item_isvalid(search, current_time)) {
-    it = do_item_reclaim(search, ntotal, clsid_based_on_ntotal, lruid);
-}
+if (it->exptime != 0 && it->exptime <= current_time) ...
 ```
 
-즉 sticky item이라도 refcount==0이고 expired/flushed/prefix invalid이면 reclaim된다.
+이 조건이 절대 true가 되지 않으므로 **TTL로 만료되는 일은 없다**.
+
+sticky item은 일반 LRU(`heads[]`/`tails[]`)가 아니라 별도 큐(`sticky_heads[]`/`sticky_tails[]`)에 있다. 일반 reclaim 루프(lowMK/curMK 탐색)는 일반 LRU만 훑으므로 정상적으로는 sticky item에 닿지 않는다.
+
+`ENABLE_STICKY_ITEM` 블록에서 sticky item을 따로 reclaim하는 경로가 있는데, 이 경로는 `sticky_curMK != NULL`일 때만 실행된다. `sticky_curMK`는 **flush_all 처리 중에만** `sticky_tails[i]`로 세팅된다.
+
+```
+flush_all 전: sticky_curMK == NULL → ENABLE_STICKY_ITEM 블록 스킵 → sticky item 건드리지 않음
+flush_all 후: sticky_curMK != NULL → do_item_isvalid()==false인 sticky item reclaim
+```
+
+prefix 무효화로 인해 invalid가 된 sticky item은 이 경로로는 정리되지 않는다. 대신 해당 key를 다시 조회할 때 `do_item_get()`에서 lazy하게 unlink된다.
+
+**결론: sticky item이 `do_item_mem_alloc()`의 reclaim 경로에서 정리되는 건 flush_all 이후에만 해당한다.**
 
 ---
 
