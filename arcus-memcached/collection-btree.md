@@ -684,3 +684,208 @@ while (node->used_count == 1 && node->ndepth > 0) {
 | ecnt 갱신 | path[] 따라 올라가며 ecnt++ | path[] 따라 올라가며 ecnt-- |
 | 균형 조정 | used_count==32 → split/sbalance | used_count<16 → merge/mbalance |
 | 트리 높이 | 루트 꽉 차면 새 루트 생성 (+1) | 루트 자식 1개 남으면 루트 축소 (-1) |
+---
+
+## smget (Sort Merge Get)
+
+### 개념
+
+smget은 여러 B+tree 키에서 bkey 범위를 동시에 조회하고, 결과를 bkey 순서로 합쳐서 반환하는 연산이다.
+
+```
+smget(keys=[A, B, C], bkey_range=[from, to], count=N)
+→ 각 키의 B+tree를 동시에 순회하며, bkey 오름차순으로 정렬된 N개 반환
+```
+
+이게 필요한 이유를 예시로 보면, 유저별 타임라인이 각각 B+tree 키로 저장되어 있을 때 여러 유저의 타임라인을 시간 순서로 합쳐서 가져오고 싶은 경우가 있다. 각 키에서 따로 조회한 뒤 클라이언트에서 합치는 것도 가능하지만, smget은 서버에서 한 번에 처리해준다.
+
+---
+
+### 핵심 자료구조
+
+smget은 두 가지 핵심 버퍼를 사용한다.
+
+```c
+btree_scan_buf[i]   // 키 하나의 현재 스캔 상태
+  .it    = hash_item (B+tree 아이템)
+  .posi  = {node, indx}  ← B+tree 내 현재 커서 위치
+  .kidx  = 몇 번째 key인지
+
+sort_sindx_buf[i]   // btree_scan_buf의 인덱스들을 bkey 순으로 정렬한 배열
+                    // sort_sindx_buf[0]이 항상 "현재 가장 작은 bkey를 가진 키"
+```
+
+`btree_scan_buf`는 각 키의 현재 스캔 상태를 저장하는 배열이고, `sort_sindx_buf`는 그 배열의 인덱스들을 bkey 순으로 정렬해서 들고 있는 배열이다. `sort_sindx_buf[0]`이 항상 지금 가장 작은 bkey를 가진 키를 가리키도록 정렬된 상태를 유지해야 한다. 이 정렬 상태를 빠르게 유지하려면 이진탐색이 필요하고, 이진탐색은 정렬된 배열에서만 동작한다.
+
+---
+
+### 2-phase 구조 (`btree_elem_smget`)
+
+```
+Phase 1: do_btree_smget_scan_sort   → 각 키의 첫 번째 elem을 찾아 정렬된 배열 초기화 (1회)
+Phase 2: do_btree_smget_elem_sort   → k-way merge로 실제 결과 수집 (N회 반복)
+```
+
+k개의 키가 각각 별개의 B+tree이기 때문에, merge를 시작하기 전에 각 트리에서 시작점을 찾아두는 초기화 단계(Phase 1)가 반드시 필요하다. Phase 2는 그 시작점들을 가지고 실제 merge를 반복하는 본체다.
+
+---
+
+### Phase 1: scan_sort
+
+각 키를 순서대로 처리하면서, 그 키의 bkey 범위 내 **첫 번째 elem**을 찾아 `sort_sindx_buf`에 이진탐색으로 삽입한다.
+
+```
+key A: 첫 elem bkey=101  →  sort_sindx_buf = [A]
+key B: 첫 elem bkey=99   →  이진탐색 삽입 → [B, A]
+key C: 첫 elem bkey=105  →  이진탐색 삽입 → [B, A, C]
+```
+
+이 단계가 끝나면 `sort_sindx_buf`는 각 키의 "현재 커서가 가리키는 elem"이 bkey 오름차순으로 정렬된 상태가 된다.
+
+여기에 **early pruning 최적화**가 들어있다. 이미 `sort_count >= req_count` 상태라면, 지금 처리 중인 키의 첫 번째 elem이 현재 버퍼의 마지막 원소보다 뒤에 있으면 이 키는 결과에 기여할 수 없다. 어차피 이 키에서 나오는 elem들은 이미 N개를 채운 것들보다 뒤에 있을 테니, 이 키는 스캔 자체를 건너뛴다.
+
+```c
+if (sort_count >= req_count) {
+    if ((ascending == true && cmp_res > 0) || (ascending == false && cmp_res < 0)) {
+        /* 이 키의 첫 elem이 이미 N번째보다 뒤 → 스킵 */
+        do_item_release(...);
+        continue;
+    }
+}
+```
+
+---
+
+### Phase 2: elem_sort — k-way merge
+
+Phase 1이 끝나고 나면 `sort_sindx_buf`에는 각 키의 "시작 커서"가 bkey 순으로 정렬된 상태로 들어있다. 이제 여기서 하나씩 꺼내면서 결과를 채운다.
+
+매 반복마다:
+1. `sort_sindx_buf[first_idx]` — 현재 가장 작은 bkey를 가진 키를 꺼냄
+2. 그 elem을 결과에 추가
+3. 해당 키의 커서를 다음 elem으로 전진
+4. 이진탐색으로 올바른 위치를 찾아서 `sort_sindx_buf`에 재삽입
+
+```
+초기: [B(99), A(101), C(105)]
+
+1회: B(99) 꺼냄 → 결과에 추가
+     B 커서 전진 → 다음 elem bkey=103
+     이진탐색으로 삽입 위치 찾기 → [A(101), B(103), C(105)]
+
+2회: A(101) 꺼냄 → 결과에 추가
+     A 커서 전진 → 다음 elem bkey=110
+     이진탐색 삽입 → [B(103), C(105), A(110)]
+
+...
+```
+
+전체 재정렬을 하지 않고, 이진탐색(O(log k))으로 삽입 위치를 찾고 시프트(O(k))로 자리를 만들어서 끼워넣는 방식이다. 매 스텝마다 O(k)이고 N개 결과를 수집하면 전체 O(N * k)가 된다.
+
+재삽입 코드:
+```c
+// 이진탐색으로 삽입 위치(right) 결정
+left  = first_idx + 1;
+right = first_idx + sort_count - 1;
+while (left <= right) {
+    mid = (left + right) / 2;
+    // bkey 비교 → left/right 조정
+}
+
+// 앞쪽 당기고 삽입
+for (i = first_idx+1; i <= right; i++) {
+    sort_sindx_buf[i-1] = sort_sindx_buf[i];
+}
+sort_sindx_buf[right] = curr_idx;
+```
+
+---
+
+### 복잡도
+
+| 단계 | 복잡도 |
+|---|---|
+| scan_sort | O(k log k) |
+| elem_sort (결과 N개) | O(N * k) |
+
+k = 키 개수. 힙 기반이면 O(N log k)가 되지만, 실제 사용에서 k가 크지 않아서 배열 + 이진탐색으로도 충분하다는 판단인 것으로 보인다.
+
+---
+
+### trim 처리 (v1 vs v2)
+
+B+tree에 overflow가 발생하면 일부 elem이 잘려나갈 수 있다(`COLL_META_FLAG_TRIMMED`). 이 trim된 공간이 smget에서 요청한 bkey 범위와 겹친다면, 결과가 불완전할 수 있다는 문제가 생긴다.
+
+| | 동작 |
+|---|---|
+| v1 (old) | trimmed key를 missed key로 처리. "이 키에 해당 범위 데이터가 없다"고 처리해버림 |
+| v2 (new) | trimmed key로 별도 기록 + 경계 elem 저장. 클라이언트가 어느 범위까지 신뢰할 수 있는지 직접 판단할 수 있게 해줌 |
+
+v2에서는 단순히 "못 찾음"이 아니라 "여기까지는 있었고, 그 이전이 잘려나갔음"을 경계 elem과 함께 알려주기 때문에 클라이언트가 좀 더 정교한 처리를 할 수 있다.
+
+```c
+do_btree_smget_add_miss(smres, kidx, ENGINE_EBKEYOOR);  // v1
+do_btree_smget_add_trim(smres, kidx, prev);             // v2: 경계 elem(prev)도 기록
+```
+
+---
+
+## 요약
+
+### 삽입
+
+1. **탐색**: 루트부터 내려가면서 각 레벨에서 이진탐색으로 어느 자식으로 갈지 결정.
+   내려갈 때마다 `path[ndepth] = {현재 노드, 내려간 슬롯 번호}` 기록.
+
+2. **삽입 위치 결정**: 리프에 도달하면 `item[]` 안에서 다시 이진탐색.
+   탐색 종료 시 `left` = "삽입 bkey보다 큰 첫 번째 슬롯 번호" → `path[0].indx = left`.
+
+3. **split** (필요한 경우): 리프가 꽉 찼으면(`used_count == 32`) 먼저 split.
+   - 형제에 여유 있으면 → sbalance로 item 재분배만 하고 끝
+   - 형제도 꽉 찼으면 → 새 노드(`n_node`) 생성 후 sbalance. 상위 노드에도 전파.
+   - 루트까지 꽉 찼으면 → 새 루트(`r_node`) 생성, 트리 depth +1
+
+4. **삽입**: `path[0].indx`부터 끝까지 슬롯을 오른쪽으로 밀고, 빈 자리에 elem 삽입. `used_count++`.
+
+5. **갱신**: `path[1]` ~ `path[루트 ndepth]`를 따라 올라가며 `ecnt[path[i].indx]++`. `ccnt++`.
+
+### 삭제
+
+1. **탐색**: 삽입과 동일하게 루트→리프 이진탐색, `path[]` 기록.
+
+2. **삭제**: 해당 슬롯부터 끝까지 왼쪽으로 당기고 제거. `used_count--`.
+   refcount > 0이면 메모리는 바로 해제 안 하고 `UNLINK` 상태로 둠.
+
+3. **갱신**: `path[1]` ~ `path[루트 ndepth]`를 따라 올라가며 `ecnt[path[i].indx]--`. `ccnt--`.
+
+4. **merge** (필요한 경우): 노드가 너무 비었으면(`used_count < 16`) merge.
+   - 형제가 16개 이상 → mbalance로 형제에서 item 당겨옴
+   - 형제도 16개 미만 → 두 노드 합치고 빈 노드 제거. 상위 노드에 전파.
+   - 루트 자식이 1개만 남으면 → 그 자식을 새 루트로 승격, 트리 depth -1
+
+| | 삽입 | 삭제 |
+|---|---|---|
+| 균형 조정 | used_count==32 → split/sbalance | used_count<16 → merge/mbalance |
+| 트리 높이 | 루트 꽉 차면 새 루트 (+1) | 루트 자식 1개 남으면 루트 축소 (-1) |
+
+### smget
+
+여러 B+tree 키에서 bkey 범위를 동시에 조회하고 bkey 순으로 합쳐서 반환. **핵심은 이진탐색과 k-way merge**다.
+
+**Phase 1 — scan_sort** (1회): k개의 키는 각각 별개의 B+tree이기 때문에, k-way merge를 시작하기 전에 먼저 각 트리에서 "범위 내 첫 번째 elem"을 찾아두어야 한다. 이 단계에서 각 키의 시작 커서를 확보하고 `sort_sindx_buf`에 이진탐색으로 삽입해서 bkey 순으로 정렬된 초기 상태를 만든다.
+→ 이미 `sort_count >= req_count`인데 새 키의 첫 elem이 버퍼 끝보다 뒤면 그 키는 스킵 (early pruning).
+
+**Phase 2 — elem_sort (k-way merge)** (반복):
+1. `sort_sindx_buf[0]` (가장 작은 bkey) 꺼내서 결과에 추가
+2. 해당 키의 커서를 다음 elem으로 전진
+3. 이진탐색으로 올바른 위치 찾아 재삽입 → 정렬 상태 유지
+4. count개 모일 때까지 반복
+
+전체 재정렬 없이 이진탐색(O(log k)) + 시프트(O(k))로 정렬 상태 유지. 복잡도 O(N·k).
+
+**trim 처리**: overflow로 잘려나간 키가 요청 범위와 겹칠 때,
+v1은 missed key로 처리, v2는 경계 elem과 함께 trimmed key로 따로 기록.
+
+> [!NOTE]
+> Phase 1은 k개의 트리가 "따로따로" 있어서 각 트리를 탐색해 시작점을 잡아야 하기 때문에 필요한 초기화 단계 (1회)
+> Phase 2는 그렇게 모인 시작점들을 가지고 실제 merge를 반복하는 본체 (N회)
