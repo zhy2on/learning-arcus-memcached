@@ -371,7 +371,21 @@ typedef struct _chkpt_st {
 
 체크포인트가 없으면 cmdlog 파일은 서버가 살아있는 동안 끝없이 커진다. 재시작할 때 처음부터 끝까지 redo해야 하니, 서비스를 오래 운영할수록 재시작 시간이 같이 늘어난다. 체크포인트는 "지금 이 순간의 메모리 상태를 파일로 찍어두고, 그 이전 cmdlog는 버린다"는 작업이다. 이후 재시작에서는 스냅샷 + 그 이후 cmdlog만 redo하면 된다.
 
-체크포인트 스레드는 서버 시작 시 생성되어 1초마다 깨어난다. 5초마다 조건을 확인하고 체크포인트가 필요한지 판단한다.
+체크포인트 스레드는 **서버 시작 시 딱 한 번 생성**되어 서버가 살아있는 동안 계속 존재한다. 메인 프로세스가 조건을 감시하다가 스레드를 띄우는 게 아니다. 스레드가 스스로 루프를 돌면서 조건을 확인하고 실행까지 담당한다.
+
+```c
+// checkpoint.c - chkpt_thread_main
+while (1) {
+    1초 sleep
+
+    5초마다 (CHKPT_CHECK_INTERVAL):
+        이전 체크포인트 파일 정리 필요하면 정리
+        do_checkpoint_needed() 조건 확인
+            → 만족하면 do_checkpoint() 실행
+}
+```
+
+1초마다 깨어나서 elapsed_time을 누적하고, 5초가 되면 조건을 확인한다. 조건을 만족하면 그 자리에서 바로 snapshot을 실행한다.
 
 ```c
 // checkpoint.c - do_checkpoint_needed
@@ -424,6 +438,48 @@ while (1) {
 
 해시테이블에서 아이템을 16개씩 긁어서 파일에 쓰고, 끝나면 `SnapshotDone` 마커를 붙인다.
 
+**해시 테이블 순회 방식**
+
+스캔은 bucket 0번부터 순서대로 진행한다. 매 루프마다 캐시 락을 잡고 16개 수집하고 해제하는 것을 반복한다. 락을 짧게 잡는 이유는 워커 스레드가 계속 요청을 처리할 수 있도록 하기 위해서다.
+
+락을 놓는 사이에 다른 스레드가 해당 버킷의 아이템을 추가/삭제할 수 있다. 스캔 위치를 잃지 않으려고 `ph_item`이라는 더미 아이템을 현재 위치의 체인에 직접 끼워넣는다. 락을 다시 잡았을 때 ph_item 다음부터 이어서 스캔한다. 책갈피 역할이다.
+
+```
+버킷 체인: [A] → [B] → [ph_item] → [C] → [D]
+                              ↑
+                        락 놓는 동안 여기 꽂아둠
+                        재진입 시 C부터 이어서 스캔
+```
+
+**캐시 락이 영향을 미치는 범위**
+
+캐시 락은 해시 테이블을 보호한다. 락을 잡는 동안:
+- **워커 스레드**: GET/SET 등 해시 테이블에 접근하는 요청이 대기
+- **log flush thread**: ring buffer → cmdlog 파일 경로만 쓰므로 해시 테이블과 무관. 캐시 락에 전혀 영향받지 않고 계속 동작
+
+16개 단위로 짧게 잡고 놓는 이유가 여기 있다. 워커 스레드의 대기 시간을 최소화하기 위해서다.
+
+**dual write: 스캔 중 워커 스레드의 write 요청 처리**
+
+`item_scan_open` 시점에 `chkpt_scanp`가 설정된다. 이 순간부터 워커 스레드들은 cmdlog를 기록할 때 `NEED_DUAL_WRITE` 매크로를 평가한다.
+
+```c
+#define NEED_DUAL_WRITE(it) \
+    ((chkpt_scanp != NULL) &&
+     (it == NULL || assoc_scan_in_visited_area(chkpt_scanp, it)))
+```
+
+`assoc_scan_in_visited_area`는 아이템의 해시 버킷 번호가 현재 스캔 커서보다 앞에 있는지 확인한다. 별도 flag 없이 커서 위치만으로 "이미 스캔됐는가"를 판단한다.
+
+| 상황 | dual write 여부 |
+|---|---|
+| 아이템의 버킷 < 현재 스캔 커서 | 구 cmdlog + 새 cmdlog 둘 다 기록 |
+| 아이템의 버킷 >= 현재 스캔 커서 | 새 cmdlog에만 기록 |
+
+이미 snapshot에 찍힌 아이템이 변경되면 구 cmdlog에도 남겨야 한다. 만약 새 snapshot이 실패했을 때 구 snapshot + 구 cmdlog 경로로 복구해야 하기 때문이다.
+
+`item_scan_close` 시점에 `chkpt_scanp = NULL`로 초기화되고 `cmdlog_buff_complete_dual_write`가 호출되어 새 cmdlog로 완전히 전환된다.
+
 여기서 스냅샷이 텍스트 덤프일 것 같지만 아니다. `do_snapshot_data_dump`를 보면 cmdlog에서 쓰던 `lrec_construct_link_item`을 그대로 호출한다.
 
 ```c
@@ -467,7 +523,16 @@ cmdlog:    IT_LINK, IT_UNLINK, IT_SETATTR, IT_FLUSH, ... (14가지 전부)
 
 포맷을 cmdlog와 통일했기 때문에 복구 코드에서 스냅샷과 cmdlog를 같은 `lrec_redo_from_record` 함수로 처리할 수 있다.
 
-스냅샷은 아이템마다 직접 디스크에 쓰지 않는다. 10MB 버퍼에 쌓다가 꽉 차면 `write()`하고, 모든 아이템을 다 쓴 뒤 `fsync()`로 한 번에 확정한다.
+스냅샷은 아이템마다 직접 디스크에 쓰지 않는다. 10MB 버퍼(`SNAPSHOT_BUFFER_SIZE`)에 쌓다가 꽉 차면 `write()`하고, 모든 아이템을 다 쓴 뒤 `fsync()`로 한 번에 확정한다.
+
+```
+버퍼 꽉 참 → write()만 (OS page cache까지만 보장)
+스캔 완료  → 남은 버퍼 write() + fsync() 한 번 (디스크까지 보장)
+```
+
+여기서 `write()`는 log flush thread가 ring buffer를 flush할 때 쓰는 `write()`와 동일한 시스템콜이다. OS page cache에 쓰는 것만 보장하고, 실제 디스크 동기화는 보장하지 않는다. `fsync()`가 와야 비로소 디스크까지 내려간 게 보장된다.
+
+그래서 스냅샷 도중 서버가 죽으면 파일이 불완전하게 남는다. 마지막 `fsync()`가 불리기 전에 죽으면 파일 내용이 디스크에 일부만 반영된 채 남을 수 있다. 복구 시 `SNAPSHOT_DONE` 마커 유무로 유효성을 판단하는 이유가 바로 이것이다.
 
 **스냅샷과 cmdlog의 경계선**
 
