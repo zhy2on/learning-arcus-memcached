@@ -323,11 +323,69 @@ ASYNC 모드의 흐름은 훨씬 단순하다.
 
 ---
 
+## 스레드 간 동기화: pthread_cond_timedwait
+
+persistence에 관여하는 스레드들이 어떻게 sleep하고 깨어나는지 이해하려면 `pthread_cond_timedwait`를 먼저 알아야 한다.
+
+### sleep() vs pthread_cond_timedwait
+
+```c
+// sleep()
+sleep(1);
+// → 무조건 1초를 꽉 채워서 기다림
+// → 다른 스레드가 깨울 방법이 없음
+```
+
+```c
+// pthread_cond_timedwait
+pthread_cond_timedwait(&cond, &lock, &1초후);
+// → 1초 기다리되, pthread_cond_signal이 오면 즉시 깨어남
+```
+
+`sleep()`은 **시간만 보고** 깨어난다. `pthread_cond_timedwait`는 **시간 또는 signal** 둘 다 보고 깨어난다.
+
+"급한 일 생기면 즉시, 아니면 주기적으로" 가 필요한 상황에서는 `pthread_cond_timedwait`가 유일한 선택이다.
+
+> **SIGALRM으로 sleep() 깨우면 안 되나?**
+> 기술적으로는 `pthread_kill(tid, SIGALRM)`으로 특정 스레드의 `sleep()`을 중단시킬 수 있다. 하지만 시그널 핸들러를 등록해야 하고, 핸들러 안에서는 async-signal-safe 함수만 쓸 수 있어 제약이 극심하다. 락과 결합해서 race condition을 막는 것도 직접 구현해야 한다. `pthread_cond`가 이 모든 걸 안전하게 내장하고 있으니 쓸 이유가 없다.
+
+### cond 변수의 역할
+
+`pthread_cond_t`는 기다리는 쪽과 깨우는 쪽 사이의 **약속 장소**다.
+
+```c
+// 기다리는 쪽 (flush thread)
+pthread_cond_timedwait(&flusher->cond, &flusher->lock, &10ms후);
+// "flusher->cond 약속 장소에서 기다릴게"
+
+// 깨우는 쪽 (worker thread)
+pthread_cond_signal(&flusher->cond);
+// "flusher->cond 약속 장소에서 기다리는 애 깨워"
+```
+
+같은 `cond`를 가리켜야 연결된다. ARCUS에서는 각 스레드의 구조체를 전역으로 선언하고 구조체 안에 `cond`를 넣어서 어디서든 같은 약속 장소를 참조할 수 있게 한다.
+
+`sleep` 플래그는 "지금 약속 장소에 실제로 서 있는가"를 확인하는 최적화다. 이미 깨어있으면 signal을 보낼 필요가 없으니 불필요한 signal을 방지한다.
+
+### 세 스레드 비교
+
+| 스레드 | sleep 방식 | 이벤트 signal 조건 |
+|---|---|---|
+| checkpoint thread | 1초 timedwait, 5초마다 조건 확인 | 서버 종료 시만 (reqstop용) |
+| log flush thread | flush 없으면 10ms timedwait | ① ring buffer에 flush queue 쌓일 때 ② SYNC waiter가 upt_flush_lsn 갱신할 때 |
+| group commit thread | waiter 없으면 1초 timedwait | 첫 번째 waiter 등록될 때 (wait_cnt 0→1) |
+
+checkpoint thread만 순수 타이머다. 체크포인트는 "cmdlog가 커졌으니 정리하자"는 배치 작업이라 몇 초 늦어도 무방하다. 반면 log flush와 group commit은 SYNC 모드 waiter의 응답 레이턴시에 직결되므로 이벤트 기반으로 즉시 반응한다.
+
+스레드별로 구조체가 분리된 것도 의미가 있다. `flusher->cond`와 `gcommit->cond`가 독립된 약속 장소이므로, 한 스레드를 깨울 때 다른 스레드에 영향이 없다.
+
+---
+
 ## ④ 체크포인트
 
 > 관련 파일: `engines/default/checkpoint.c`, `engines/default/chkpt_snapshot.c`
 
-`checkpoint.c`에는 이름이 비슷한 두 진입점이 있다. 헷갈리지 않도록 먼저 구분해두자.
+`checkpoint.c`에는 두 지점이 있다.
 
 - **체크포인트**: `chkpt_thread_main` → `do_checkpoint`. 서버 운영 중 주기적으로 스냅샷을 만드는 경로다.
 - **복구**: `chkpt_recovery_analysis` → `chkpt_recovery_redo`. 재시작 시 딱 한 번, 기존 파일을 읽어 메모리를 복원하는 경로다.
@@ -438,9 +496,31 @@ while (1) {
 
 해시테이블에서 아이템을 16개씩 긁어서 파일에 쓰고, 끝나면 `SnapshotDone` 마커를 붙인다.
 
+`item_scan_getnext`의 반환값 규약을 보면 코드에 FIXME 주석이 달려있다.
+
+```c
+if (item_count == -2) { /* FIXME: rethink itscan_getnext() interface */
+    /* OUT OF MEMORY */
+    break;
+}
+```
+
+반환값이 세 가지 상태를 표현한다:
+
+| 반환값 | 의미 |
+|---|---|
+| 양수 | 수집한 아이템 수 |
+| 0 | 유효한 아이템 없음 (스캔 계속) |
+| -1 | 스캔 끝 (정상 종료) |
+| -2 | OOM (에러) |
+
+-1과 -2라는 매직 넘버 두 개로 서로 다른 종료 상태를 구분하고 있다. 호출하는 쪽에서 "끝인가 에러인가"를 직접 숫자로 구분해야 해서 인터페이스가 직관적이지 않다. 더 나은 설계라면 에러를 별도 출력 파라미터로 빼거나 enum으로 상태를 명확히 표현하는 방식이 있다. 개발자가 이를 인지하고 "나중에 인터페이스를 다시 생각하자"는 메모를 남긴 것이다.
+
 **해시 테이블 순회 방식**
 
 스캔은 bucket 0번부터 순서대로 진행한다. 매 루프마다 캐시 락을 잡고 16개 수집하고 해제하는 것을 반복한다. 락을 짧게 잡는 이유는 워커 스레드가 계속 요청을 처리할 수 있도록 하기 위해서다.
+
+배치 크기 16은 컴파일타임 상수(`SCAN_ITEM_ARRAY_SIZE`)로 런타임에 바꿀 수 없다. 코드에 주석처리된 64 버전이 남아있는 걸 보면 한 번 시도했다가 낮춘 흔적이다. 크게 잡으면 락 획득 횟수가 줄어 오버헤드는 낮아지지만 락을 잡고 있는 시간이 길어져 워커 스레드 대기가 늘어난다. 16은 그 균형점이다. dump 명령은 같은 이름의 상수를 64로 별도 정의해서 쓴다 — dump는 워커 스레드 응답 레이턴시에 덜 민감하니까 더 크게 잡은 것이다.
 
 락을 놓는 사이에 다른 스레드가 해당 버킷의 아이템을 추가/삭제할 수 있다. 스캔 위치를 잃지 않으려고 `ph_item`이라는 더미 아이템을 현재 위치의 체인에 직접 끼워넣는다. 락을 다시 잡았을 때 ph_item 다음부터 이어서 스캔한다. 책갈피 역할이다.
 
@@ -450,6 +530,41 @@ while (1) {
                         락 놓는 동안 여기 꽂아둠
                         재진입 시 C부터 이어서 스캔
 ```
+
+**스캔 종료 조건: bucket >= hashsz**
+
+스캔이 끝났는지는 `h_next == NULL`이 아니라 버킷 인덱스로 판단한다.
+
+```c
+while (scan->bucket < scan->hashsz)  // 모든 버킷 순회
+    ...
+
+if (scan->bucket >= scan->hashsz)
+    item_count = -1;  // 끝
+```
+
+버킷 체인을 끝까지 따라가다 `h_next == NULL`을 만나도 그건 그 버킷의 체인이 끝난 것일 뿐이다. 전체 스캔 완료는 `bucket >= hashsz`, 즉 모든 버킷을 다 돌았는지로 판단한다.
+
+**hashsz는 스캔 시작 시 고정된다**
+
+`assoc_scan_init`에서 `scan->hashsz = assocp->hashsize`로 한 번 읽고 스캔 내내 그 값을 쓴다. 기본값은 64K(`hashpower = 16`이므로 `1 << 16`).
+
+ARCUS 해시 테이블은 두 차원으로 구성된다:
+- `hashsize`: 버킷 수 (64K, 변하지 않음)
+- `rootsize`: 루트 테이블 수 (처음 1, 아이템이 많아지면 2배씩 확장)
+
+아이템이 늘어나면 버킷을 더 만드는 게 아니라 루트 테이블을 늘린다. 총 슬롯 수는 `hashsize × rootsize`다. 따라서 해시 테이블이 확장돼도 `hashsz`는 변하지 않는다.
+
+각 버킷을 순회할 때 `scan->tabcnt = assocp->rootsize`를 그때그때 읽는다. 스캔 도중 확장이 일어났다면 다음 버킷부터는 자동으로 늘어난 rootsize가 반영된다.
+
+**새 아이템이 계속 들어와도 스냅샷이 무한히 늘어나지 않는다**
+
+스냅샷은 고정된 64K 버킷을 다 돌면 끝난다. 새 아이템은 기존 버킷 중 하나에 들어갈 뿐이므로 버킷 수 자체는 늘어나지 않는다.
+
+- 이미 스캔한 버킷에 아이템이 추가됨 → dual-write가 커버
+- 아직 안 스캔한 버킷에 아이템이 추가됨 → 나중에 스캔 시 자연스럽게 포함
+
+어느 경우든 스냅샷은 반드시 64K 버킷을 다 돈 시점에 끝난다.
 
 **캐시 락이 영향을 미치는 범위**
 
