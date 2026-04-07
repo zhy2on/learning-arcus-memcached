@@ -311,7 +311,59 @@ Redis의 싱글 스레드가 이 모든 락을 없애는 대신 코어를 하나
 
 Redis는 이 둘을 완전히 다른 포맷으로 저장한다. RDB는 메모리 상태를 직렬화한 바이너리고, AOF는 `set foo bar` 같은 명령어 텍스트를 그대로 쌓는다. 포맷도 다르고 복구 코드도 다르다.
 
-ARCUS는 다른 선택을 했다. 스냅샷도, cmdlog도 둘 다 같은 바이너리 레코드 포맷으로 저장한다. 명령어 원문이 아니라 파싱이 끝난 구조체 형태로, "어떤 상태를 만들어라"는 결과 중심의 레코드다. `set foo bar`라는 명령어를 저장하는 게 아니라 `IT_LINK: key=foo, value=bar, exptime=..., cas=...`처럼 실행 결과를 구조체로 저장한다.
+ARCUS는 다른 선택을 했다. 스냅샷도, cmdlog도 둘 다 같은 바이너리 레코드 포맷으로 저장한다.
+
+---
+
+## 10. 스냅샷의 point-in-time 보장 방식
+
+### Redis: fork() + Copy-On-Write
+
+Redis는 `BGSAVE` 또는 자동 RDB 저장 시 `fork()`로 자식 프로세스를 만든다. OS의 COW(Copy-On-Write) 덕분에 자식은 fork 시점의 메모리를 그대로 본다. 부모가 계속 수정해도 자식이 보는 페이지는 변하지 않는다. **완벽한 point-in-time 스냅샷**이다.
+
+```
+fork() 시점 T:
+  부모 프로세스: 계속 클라이언트 요청 처리 (페이지 수정 시 COW 복사)
+  자식 프로세스: T 시점 메모리를 고정된 상태로 RDB 작성
+  → 자식이 보는 데이터는 항상 T 시점 값
+```
+
+단점은 메모리다. 수정이 많을수록 COW로 복사되는 페이지가 늘어나 최악의 경우 메모리가 2배 필요하다.
+
+### ARCUS: 스레드 기반 스캔
+
+ARCUS는 fork 없이 checkpoint thread가 직접 해시 테이블을 bucket 단위로 순회한다. 스캔하는 동안 워커 스레드는 계속 동작하므로 **스냅샷이 단일 시점을 나타내지 않는다.**
+
+```
+bucket 0~29 스캔 완료
+  → 워커가 bucket 15의 아이템 수정
+  → 스냅샷에는 수정 전 값이 담겨있음
+
+bucket 30~99 스캔 중
+  → 워커가 bucket 70의 아이템 수정
+  → 스캔이 도달했을 때 이미 수정된 값을 담음
+```
+
+이게 문제가 되지 않는 이유가 dual-write다. 이미 스캔된 버킷의 아이템이 수정되면 구 cmdlog와 새 cmdlog 양쪽에 기록된다. 복구 시 snapshot + cmdlog를 순서대로 적용하면 최종 상태는 항상 정확하다. 스냅샷이 point-in-time이 아니어도 cmdlog가 빈틈을 채운다.
+
+### dump는 다르다
+
+checkpoint snapshot은 dual-write로 보완되지만, **dump 명령은 dual-write가 없다.** 스캔 도중 수정된 값이 그대로 담기거나, 삭제된 아이템이 포함되거나, 새로 추가된 아이템이 누락될 수 있다. best-effort 조회 도구다.
+
+Redis는 dump도 fork() 기반이라 항상 point-in-time이 보장된다.
+
+### RDBMS는 어떻게 하나 — MVCC
+
+RDBMS(PostgreSQL, MySQL InnoDB 등)는 fork도 쓰지 않는다. **MVCC(Multi-Version Concurrency Control)**로 해결한다. 데이터를 수정할 때 기존 버전을 지우지 않고 새 버전을 추가한다. dump 트랜잭션이 시작한 시점의 버전만 보이므로 다른 트랜잭션이 아무리 수정해도 일관된 뷰가 유지된다.
+
+ARCUS가 MVCC를 도입하지 않는 이유는 **인메모리 캐시이기 때문**이다. 디스크 기반 RDBMS는 여러 버전을 디스크에 저장하는 비용을 감당할 수 있지만, 메모리에 올라있는 캐시 아이템의 구버전까지 메모리에 들고 있으면 메모리 효율이 크게 떨어진다.
+
+| 방식 | 대표 | point-in-time 보장 | 비용 |
+|---|---|---|---|
+| fork + COW | Redis | 완벽 | 메모리 최대 2배 |
+| MVCC | PostgreSQL, MySQL | 완벽 | 버전 스토리지 + vacuum |
+| 스레드 스캔 + dual-write | ARCUS snapshot | 복구 정확성만 보장 | 추가 메모리 없음 |
+| 스레드 스캔 (no dual-write) | ARCUS dump | 미보장 (best-effort) | 없음 | 명령어 원문이 아니라 파싱이 끝난 구조체 형태로, "어떤 상태를 만들어라"는 결과 중심의 레코드다. `set foo bar`라는 명령어를 저장하는 게 아니라 `IT_LINK: key=foo, value=bar, exptime=..., cas=...`처럼 실행 결과를 구조체로 저장한다.
 
 스냅샷에 담기는 레코드는 두 종류뿐이다. 아이템 하나당 `IT_LINK` 레코드 하나, 컬렉션이면 뒤에 `SNAPSHOT_ELEM` 레코드들이 이어진다. 그게 전부다. unlink도 없고 setattr도 없다. 스캔 시점에 메모리에 살아있는 아이템만 찍으니 이미 삭제되거나 만료된 아이템은 아예 포함되지 않는다. "지금 존재하는 아이템을 전부 다시 link하면 스냅샷 시점과 동일한 상태가 된다"는 발상이다.
 
